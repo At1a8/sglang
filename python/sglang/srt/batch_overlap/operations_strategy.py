@@ -34,6 +34,7 @@ class OperationsStrategy:
     def init_new_tbo(
         layers: torch.nn.ModuleList,
         forward_mode: ForwardMode,
+        use_cp: bool = False,
     ) -> "OperationsStrategy":
         layer_name = layers[0].__class__.__name__
         if layer_name == "DeepseekV2DecoderLayer":
@@ -67,7 +68,7 @@ class OperationsStrategy:
             return OperationsStrategy.concat(
                 [
                     _compute_moe_deepseek_v4_layer_operations_strategy_tbo(
-                        layer, forward_mode
+                        layer, forward_mode, use_cp=use_cp
                     )
                     for layer in layers
                 ]
@@ -170,9 +171,10 @@ def _compute_moe_deepseek_blog_decode(layer):
 def _compute_moe_deepseek_v4_layer_operations_strategy_tbo(
     layer: torch.nn.Module,
     forward_mode: ForwardMode,
+    use_cp: bool = False,
 ) -> OperationsStrategy:
     if forward_mode == ForwardMode.EXTEND:
-        return _compute_moe_deepseek_v4_prefill(layer)
+        return _compute_moe_deepseek_v4_prefill(layer, use_cp=use_cp)
     else:
         # Decode TBO for DSV4 is not implemented yet (ATOM data: decode TBO
         # regresses; needs cuda-graph capture work). Prefill-only for now.
@@ -181,10 +183,39 @@ def _compute_moe_deepseek_v4_layer_operations_strategy_tbo(
         )
 
 
-def _compute_moe_deepseek_v4_prefill(layer):
+def _compute_moe_deepseek_v4_prefill(layer, use_cp: bool = False):
     from sglang.srt.layers.moe import get_moe_a2a_backend
 
-    if get_moe_a2a_backend().is_none():
+    if use_cp:
+        # DSA prefill context-parallel (round-robin / interleave), TP-MoE:
+        # overlap the CP-group all-gather (pre-MoE) + reduce-scatter (post-MoE)
+        # with the other ubatch's attn + expert compute. op_attn keeps its own
+        # per-layer CP KV/indexer/compressor all-gathers (pushed onto the comm
+        # stream in a later stage). Driven by DeepseekV4Model._forward_layers_tbo_cp.
+        assert get_moe_a2a_backend().is_none(), (
+            "DSA prefill CP + TBO is only wired for the non-EP TP-MoE path "
+            "(moe_a2a_backend == none)."
+        )
+        ops = [
+            layer.op_mhc_prepare_attn,
+            # Stage 2b: split attention so this ubatch's KV all-gather (launched
+            # deferred on the comm stream in op_attn_prep) overlaps the OTHER
+            # ubatch's prep compute across the yield; op_attn_core waits it +
+            # runs indexer/compressor + sparse attention.
+            layer.self_attn.op_attn_prep,
+            operations.YieldOperation(),
+            layer.self_attn.op_attn_core,
+            layer.op_mhc_post_attn_pre_mlp,
+            layer.op_cp_gather_a,
+            operations.YieldOperation(),
+            layer.op_cp_gather_b,
+            layer.op_cp_moe,
+            layer.op_cp_combine_a,
+            operations.YieldOperation(),
+            layer.op_cp_combine_b,
+            layer.op_mhc_postprocess,
+        ]
+    elif get_moe_a2a_backend().is_none():
         # Non-EP DP TP-MoE: overlap the DP all_gatherv (gather) + reduce_scatterv
         # (combine) with the other ubatch's attn+MoE compute (ATOM's DSV4 path).
         ops = [

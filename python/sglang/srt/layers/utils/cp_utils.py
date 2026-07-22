@@ -284,7 +284,47 @@ def cp_all_gather_reorganized_into_tensor_kv_cache(
     return outputs
 
 
-def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
+# CP+TBO: when set, the round-robin CP all-gathers (KV / indexer key /
+# compressor kv_score / final hidden restore) run on this shared comm stream
+# instead of the compute stream. All CP-group collectives (these + the MoE
+# gather/reduce-scatter) must share ONE stream so they serialize in-order --
+# RCCL deadlocks if same-communicator collectives run concurrently across
+# streams. Overlap still happens because one ubatch's comm-stream collective
+# runs while the other ubatch's compute runs on the compute stream. Set only
+# during DeepseekV4Model._forward_layers_tbo_cp op execution (single-threaded).
+_CP_TBO_COMM_STREAM = None
+
+
+def set_cp_tbo_comm_stream(stream) -> None:
+    global _CP_TBO_COMM_STREAM
+    _CP_TBO_COMM_STREAM = stream
+
+
+def get_cp_tbo_comm_stream():
+    return _CP_TBO_COMM_STREAM
+
+
+def cp_tbo_wait_pending_gathers(forward_batch) -> None:
+    """Make the compute stream wait for all deferred CP all-gathers registered on
+    this ubatch's forward_batch, then clear them. Used by op_attn_core to wait the
+    KV gather that op_attn_prep launched (non-blocking) on the comm stream, so the
+    gather overlaps the OTHER ubatch's prep compute in between (Stage 2b)."""
+    lst = getattr(forward_batch, "_cp_pending_gather_events", None)
+    if not lst:
+        return
+    compute = torch.cuda.current_stream()
+    for ev in lst:
+        compute.wait_event(ev)
+    lst.clear()
+    # Buffers are now safe to free (compute is ordered after the gathers).
+    ka = getattr(forward_batch, "_cp_pending_gather_keepalive", None)
+    if ka:
+        ka.clear()
+
+
+def cp_all_gather_rerange_output(
+    input_tensor, cp_size, forward_batch, stream, defer_event=None
+):
     """
     # for in-seq-split
     |   +-----------before allgather------------+|
@@ -322,17 +362,55 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
             output_tensor = input_tensor.new_empty(
                 (input_tensor.shape[0] * cp_size, *input_tensor.shape[1:]),
             )
-        attn_cp_all_gather_into_tensor(
-            output_tensor,
-            input_tensor,
-        )
         out_shape = output_tensor.shape
-        output_tensor = (
+        comm_stream = get_cp_tbo_comm_stream()
+        if comm_stream is not None:
+            # CP+TBO: run the all-gather + rerange on the shared comm stream so
+            # all CP-group collectives serialize on one stream (no cross-stream
+            # concurrent same-communicator ops -> no RCCL deadlock).
+            #   * defer_event set  -> record it after the rerange and register on
+            #     the forward_batch WITHOUT making compute wait. op_attn_core
+            #     later waits it (cp_tbo_wait_pending_gathers), so this gather
+            #     overlaps the OTHER ubatch's compute in between (Stage 2b, KV).
+            #   * defer_event None -> compute waits here (indexer/compressor and
+            #     the final hidden restore consume the result immediately).
+            compute = torch.cuda.current_stream()
+            comm_stream.wait_stream(compute)
+            with torch.cuda.stream(comm_stream):
+                attn_cp_all_gather_into_tensor(output_tensor, input_tensor)
+                reranged = (
+                    output_tensor.view(cp_size, -1, *out_shape[1:])
+                    .transpose(0, 1)
+                    .reshape(out_shape)
+                )
+                if defer_event is not None:
+                    defer_event.record(comm_stream)
+            if defer_event is not None:
+                lst = getattr(forward_batch, "_cp_pending_gather_events", None)
+                if lst is None:
+                    lst = []
+                    forward_batch._cp_pending_gather_events = lst
+                lst.append(defer_event)
+                # Keep the gather input + output buffers alive until the event is
+                # waited (op_attn_core). Both are locals here; without a ref they
+                # are freed when this returns and reused on the COMPUTE stream by
+                # the other ubatch's prep BEFORE the deferred COMM-stream gather /
+                # rerange reads/writes them -> corruption (garbage output).
+                ka = getattr(forward_batch, "_cp_pending_gather_keepalive", None)
+                if ka is None:
+                    ka = []
+                    forward_batch._cp_pending_gather_keepalive = ka
+                ka.append(input_tensor)
+                ka.append(output_tensor)
+            else:
+                compute.wait_stream(comm_stream)
+            return reranged
+        attn_cp_all_gather_into_tensor(output_tensor, input_tensor)
+        return (
             output_tensor.view(cp_size, -1, *out_shape[1:])
             .transpose(0, 1)
             .reshape(out_shape)
         )
-        return output_tensor
 
     # TODO: Do we need to remove the padding here?
     bs_seq_len, hidden_size = input_tensor.shape

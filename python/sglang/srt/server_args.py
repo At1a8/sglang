@@ -7521,10 +7521,21 @@ class ServerArgs:
         # DP TP-MoE path (overlapping the DP all_gatherv / reduce_scatterv with
         # the other ubatch's compute), which requires DP attention. Enabling it
         # there needs no extra opt-in env flag.
+        #
+        # DSA prefill context-parallel (round-robin / interleave) is the other
+        # valid non-EP TBO path: it overlaps the CP-group all-gather /
+        # reduce-scatter (and per-layer attention CP all-gathers) instead of the
+        # DP gatherv, so it does NOT require DP attention (which is force-off for
+        # dp_size == 1 anyway). See DeepseekV4Model._forward_layers_tbo_cp.
+        cp_tbo = (
+            self.enable_dsa_prefill_context_parallel
+            and self.dsa_prefill_cp_mode == "round-robin-split"
+        )
         if (
             self.enable_two_batch_overlap
             and self.moe_a2a_backend == "none"
             and not self.enable_dp_attention
+            and not cp_tbo
         ):
             raise ValueError(
                 "When enabling two batch overlap without an EP a2a backend "

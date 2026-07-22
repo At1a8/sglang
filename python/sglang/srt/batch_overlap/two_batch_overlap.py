@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import logging
+import math
 from dataclasses import replace
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
@@ -670,9 +671,20 @@ class TboForwardBatchPreparer:
             output_dict[key] = old_value[start_token_index:end_token_index]
 
         attention_tp_size = get_parallel().attn_tp_size
-        _tbo_padded_len = (
-            (end_token_index - start_token_index - 1) // attention_tp_size + 1
-        ) * attention_tp_size
+        # Under DSA prefill context parallelism (round-robin / interleave), each
+        # ubatch is later round-robin split (token_idx % cp_size) inside the
+        # model forward and its attention metadata is CP-reindexed; both require
+        # the per-ubatch (padded) token count to be divisible by cp_size. Align
+        # the padded length to lcm(attn_tp_size, cp_align) so both the attn-TP
+        # reduce-scatter and the CP round-robin split are satisfied. cp_align is
+        # 1 when CP is off, so non-CP TBO keeps the original attn_tp_size-only
+        # alignment.
+        from sglang.srt.layers.cp.padding import get_cp_padding_align_size
+
+        cp_align = get_cp_padding_align_size()
+        align = math.lcm(attention_tp_size, cp_align)
+        n_tokens = end_token_index - start_token_index
+        _tbo_padded_len = ((n_tokens + align - 1) // align) * align
         output_dict["tbo_padded_len"] = _tbo_padded_len
 
         for key in [

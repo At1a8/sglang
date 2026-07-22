@@ -62,6 +62,8 @@ from sglang.srt.layers.communicator_dsa_cp import (
 )
 from sglang.srt.layers.dp_attention import (
     _tbo_event,
+    attn_cp_all_gather_into_tensor,
+    attn_cp_reduce_scatter_tensor,
     attn_tp_all_gather,
     attn_tp_all_reduce,
     dp_gather_partial,
@@ -93,6 +95,7 @@ from sglang.srt.layers.utils.cp_utils import (
     cp_split_and_rebuild_data,
     cp_split_and_rebuild_position,
     prepare_context_parallel_metadata,
+    set_cp_tbo_comm_stream,
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.mem_cache.memory_pool import RadixAttention
@@ -217,6 +220,16 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 # gather instead of on the gathered global buffer. Requires
 # SGLANG_SHARED_EXPERT_TP1=1 (replicated shared expert). Default OFF.
 _SHARED_EXPERT_LOCAL = get_bool_env_var("SGLANG_DP_SHARED_EXPERT_LOCAL")
+# CP + TBO: route the CP-group collectives (attention KV/indexer/compressor
+# all-gathers + MoE gather/reduce-scatter) onto the shared TBO comm stream so
+# one ubatch's collective overlaps the other's compute. All CP collectives must
+# share ONE stream (RCCL deadlocks on concurrent same-communicator ops across
+# streams). Default OFF: with op_attn still atomic (no prep/core yield), the
+# attention gathers only serialize on the comm queue instead of overlapping,
+# which measured slightly slower than plain compute-stream execution; the flag
+# keeps the overlap path available for the follow-up that splits op_attn so the
+# attention collectives also overlap the other ubatch's compute.
+_CP_TBO_COMM_OVERLAP = get_bool_env_var("SGLANG_CP_TBO_COMM_OVERLAP", "false")
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx942_supported = is_gfx942_supported()
 
@@ -896,7 +909,7 @@ class MQALayer(MqaAttentionBase):
 
         return q
 
-    def _forward_prepare(
+    def _compute_qkv(
         self,
         x: torch.Tensor,
         positions: torch.Tensor,
@@ -904,7 +917,12 @@ class MQALayer(MqaAttentionBase):
         attn_backend,
         q_out: Optional[torch.Tensor] = None,
         x_quant=None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        defer_kv_event=None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+        # Compute q and (for the DSA-CP path) the cross-rank-gathered bf16 KV.
+        # Returns (q, kv, q_lora); the indexer/compressor run separately in
+        # _run_index_compress so the CP+TBO path can launch the KV all-gather
+        # deferred (defer_kv_event) in op_attn_prep and consume it in op_attn_core.
         x_linear = x_quant if x_quant is not None else x
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x_linear)
@@ -1034,11 +1052,15 @@ class MQALayer(MqaAttentionBase):
                     # unified_kv + DSA CP: the 2-source prefill path needs the
                     # FULL current-chunk KV (extend source + ring write), so
                     # all-gather the per-rank bf16 KV across the CP group.
+                    # defer_kv_event (CP+TBO op_attn_prep) launches this gather on
+                    # the comm stream WITHOUT waiting, so it overlaps the other
+                    # ubatch's prep compute; op_attn_core waits it before use.
                     kv = cp_all_gather_rerange_output(
                         kv.contiguous(),
                         self.cp_size,
                         forward_batch,
                         torch.cuda.current_stream(),
+                        defer_event=defer_kv_event,
                     )
             elif use_cp:
                 # NSA CP: keep bf16 kv around for the cross-rank all-gather, then
@@ -1062,7 +1084,13 @@ class MQALayer(MqaAttentionBase):
                 kv = None
 
         del qkv_a
+        return q, kv, q_lora
 
+    def _run_index_compress(self, x, q_lora, forward_batch, attn_backend) -> None:
+        # DSA indexer (top-k page selection) + compressor (compressed-KV write).
+        # Split out of _compute_qkv so the CP+TBO path can run these in
+        # op_attn_core AFTER the deferred KV all-gather (they consume their own
+        # CP all-gathers of index-key / kv-score, not the KV gather).
         if self.indexer is not None:
             self.indexer(
                 x=x,
@@ -1078,6 +1106,22 @@ class MQALayer(MqaAttentionBase):
                 self.compressor,
             )
 
+    def _forward_prepare(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        attn_backend,
+        q_out: Optional[torch.Tensor] = None,
+        x_quant=None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        # Non-TBO prep: compute q/kv then run indexer/compressor inline (original
+        # behavior). The CP+TBO path instead calls _compute_qkv (KV gather
+        # deferred) in op_attn_prep and _run_index_compress in op_attn_core.
+        q, kv, q_lora = self._compute_qkv(
+            x, positions, forward_batch, attn_backend, q_out, x_quant=x_quant
+        )
+        self._run_index_compress(x, q_lora, forward_batch, attn_backend)
         return q, kv
 
     def forward(
@@ -1106,32 +1150,7 @@ class MQALayer(MqaAttentionBase):
             and not (_is_hip and self.compressor is None)
         )
 
-        tp_slice, q_padded, q_out = slice(None), None, None
-        if self.tp_size > 1:
-            # FlashMLA's fp8 sparse decode kernel only specializes h_q for {64, 128}.
-            # Pad the per-rank heads to 64 (not the full n_heads) when they fit, to
-            # dispatch the cheaper decode::head64 variant; attn_sink is sliced to
-            # this rank and padded to match.
-            padded_num_heads = 64 if self.n_local_heads <= 64 else self.n_heads
-            # Only [0:n_local_heads] is written below. Uninitialized padded TP
-            # heads inject NaN into attention on gfx942 (fnuz), so zero-init
-            # there; other archs tolerate new_empty and skip the per-forward
-            # memset.
-            if _is_gfx942_supported:
-                q_padded = x.new_zeros(x.shape[0], padded_num_heads, self.head_dim)
-            else:
-                q_padded = x.new_empty(x.shape[0], padded_num_heads, self.head_dim)
-            tp_slice = slice(0, self.n_local_heads)
-            q_out = q_padded[:, tp_slice, :]
-            if self._attn_sink_local is None:
-                # Build once on the first forward (post weight load); a per-call
-                # rebuild would replay a fill+copy per layer in the decode graph.
-                rank = self.tp_rank
-                sink = self.attn_sink.new_zeros(padded_num_heads)
-                sink[: self.n_local_heads] = self.attn_sink[
-                    rank * self.n_local_heads : (rank + 1) * self.n_local_heads
-                ]
-                self._attn_sink_local = sink
+        tp_slice, q_padded, q_out = self._forward_setup_q(x)
 
         if enable_multi_stream:
             # Multi-stream path always fuses cache write into the K kernel,
@@ -1165,6 +1184,48 @@ class MQALayer(MqaAttentionBase):
                 x_quant=x_quant,
             )
 
+        return self._forward_attend(
+            q, kv, tp_slice, q_padded, q_out, positions, forward_batch
+        )
+
+    def _forward_setup_q(self, x: torch.Tensor):
+        # Build the padded q buffer / TP head slice / attn-sink slice used by the
+        # sparse attention. Extracted from forward so op_attn_prep can reuse it.
+        tp_slice, q_padded, q_out = slice(None), None, None
+        if self.tp_size > 1:
+            # FlashMLA's fp8 sparse decode kernel only specializes h_q for {64, 128}.
+            # Pad the per-rank heads to 64 (not the full n_heads) when they fit, to
+            # dispatch the cheaper decode::head64 variant; attn_sink is sliced to
+            # this rank and padded to match.
+            padded_num_heads = 64 if self.n_local_heads <= 64 else self.n_heads
+            # Only [0:n_local_heads] is written below. Uninitialized padded TP
+            # heads inject NaN into attention on gfx942 (fnuz), so zero-init
+            # there; other archs tolerate new_empty and skip the per-forward
+            # memset.
+            if _is_gfx942_supported:
+                q_padded = x.new_zeros(x.shape[0], padded_num_heads, self.head_dim)
+            else:
+                q_padded = x.new_empty(x.shape[0], padded_num_heads, self.head_dim)
+            tp_slice = slice(0, self.n_local_heads)
+            q_out = q_padded[:, tp_slice, :]
+            if self._attn_sink_local is None:
+                # Build once on the first forward (post weight load); a per-call
+                # rebuild would replay a fill+copy per layer in the decode graph.
+                rank = self.tp_rank
+                sink = self.attn_sink.new_zeros(padded_num_heads)
+                sink[: self.n_local_heads] = self.attn_sink[
+                    rank * self.n_local_heads : (rank + 1) * self.n_local_heads
+                ]
+                self._attn_sink_local = sink
+        return tp_slice, q_padded, q_out
+
+    def _forward_attend(
+        self, q, kv, tp_slice, q_padded, q_out, positions, forward_batch
+    ) -> torch.Tensor:
+        # Sparse attention + output projection. Extracted from forward so
+        # op_attn_core can run it after the deferred KV all-gather + indexer /
+        # compressor (CP+TBO Stage 2b).
+        attn_backend = get_attn_backend()
         # The cache write is always fused / already done by _forward_prepare* --
         # tell the backend to skip its own store_cache. When `kv is None`
         # (no DSA-CP), pass `q` as a sentinel for the `k is v` assert; the
@@ -1285,6 +1346,62 @@ class MQALayer(MqaAttentionBase):
             positions=state.positions,
             forward_batch=state.forward_batch,
             x_quant=state.pop("attn_x_quant"),
+        )
+
+    # ---- CP + TBO Stage 2b: split op_attn into prep (launch KV all-gather
+    # deferred on the comm stream) + core (indexer/compressor + wait KV + sparse
+    # attention), with a YIELD between so this ubatch's KV all-gather overlaps
+    # the OTHER ubatch's prep compute. Used only by the CP prefill op strategy.
+    def op_attn_prep(self, state):
+        from sglang.srt.layers.dp_attention import _tbo_event
+
+        fb = state.forward_batch
+        x = state.pop("hidden_states_after_input_norm")
+        x_quant = state.pop("attn_x_quant")
+        attn_backend = get_attn_backend()
+        tp_slice, q_padded, q_out = self._forward_setup_q(x)
+        # Persistent per-ubatch event (avoids HSA signal-pool exhaustion from
+        # fresh events per layer); recorded on the comm stream after the KV
+        # all-gather, waited in op_attn_core.
+        kv_event = _tbo_event(("cp_attn_kv", state.tbo_subbatch_index))
+        q, kv, q_lora = self._compute_qkv(
+            x,
+            state.positions,
+            fb,
+            attn_backend,
+            q_out,
+            x_quant=x_quant,
+            defer_kv_event=kv_event,
+        )
+        state.attn_x = x
+        state.attn_q = q
+        state.attn_kv = kv
+        state.attn_q_lora = q_lora
+        state.attn_tp_slice = tp_slice
+        state.attn_q_padded = q_padded
+        state.attn_q_out = q_out
+
+    def op_attn_core(self, state):
+        from sglang.srt.layers.utils.cp_utils import cp_tbo_wait_pending_gathers
+
+        fb = state.forward_batch
+        attn_backend = get_attn_backend()
+        # indexer / compressor consume their OWN CP all-gathers (index-key /
+        # kv-score), independent of the KV gather; run them here.
+        self._run_index_compress(
+            state.pop("attn_x"), state.pop("attn_q_lora"), fb, attn_backend
+        )
+        # Wait the deferred KV all-gather (launched in op_attn_prep) before the
+        # sparse attention reads the gathered KV.
+        cp_tbo_wait_pending_gathers(fb)
+        state.hidden_states_after_attn = self._forward_attend(
+            state.pop("attn_q"),
+            state.pop("attn_kv"),
+            state.pop("attn_tp_slice"),
+            state.pop("attn_q_padded"),
+            state.pop("attn_q_out"),
+            state.positions,
+            fb,
         )
 
 
@@ -2035,6 +2152,110 @@ class DeepseekV4DecoderLayer(nn.Module):
             hidden = hidden + shared_local[:n]
         state.hidden_states_mlp_output = hidden
 
+    # ------------------------------------------------------------------
+    # DSA prefill context-parallel (round-robin / interleave) TBO ops.
+    #
+    # These replace the DP op_gather/op_moe/op_combine with the CP-group
+    # all-gather (pre-MoE) + reduce-scatter (post-MoE) around the TP-sharded
+    # MoE. op_mhc_* and op_attn are reused as-is: op_attn runs this ubatch's CP
+    # attention (its KV / indexer / compressor all-gathers happen inside on the
+    # per-child backend, whose metadata was CP-reindexed in
+    # DeepseekV4Model._setup_child_cp_metadata). The MoE input hidden is gathered
+    # across the CP group into the full (rearranged) sequence, the experts run
+    # TP-sharded with the MoE-internal all_reduce skipped (mlp_reduce_scatter=
+    # True), and the partial sums are reduce-scattered back to this CP rank's
+    # local tokens -- mirroring _run_moe_ffn_dp_sync's _use_cp branch.
+    #
+    # Stage 1 issues the CP collectives on the compute stream (correct, no
+    # overlap); a later stage moves them to the shared comm stream so one
+    # ubatch's collective overlaps the other ubatch's compute.
+    # ------------------------------------------------------------------
+    def op_cp_gather_a(self, state):
+        # CP-group all-gather (local MoE-input hidden -> full, rearranged
+        # sequence). With overlap enabled, launch on the shared TBO comm stream
+        # and record a persistent event, so it overlaps the other ubatch's
+        # compute; all CP collectives share this one comm stream so they
+        # serialize in-order (RCCL requires same-communicator ops not to run
+        # concurrently across streams). With overlap disabled, run inline on the
+        # compute stream.
+        local = state.pop("hidden_states_mlp_input")
+        cp_size = get_parallel().attn_cp_size
+        sub = state.tbo_subbatch_index
+        global_hidden = get_tbo_persistent_buffer(
+            ("cpgh", sub),
+            local.shape[0] * cp_size,
+            local.shape[1],
+            local.dtype,
+            local.device,
+        )
+        if _CP_TBO_COMM_OVERLAP:
+            comm = get_dp_tbo_comm_stream()
+            compute = torch.cuda.current_stream()
+            with torch.cuda.stream(comm):
+                comm.wait_stream(compute)
+                attn_cp_all_gather_into_tensor(global_hidden, local.contiguous())
+                state.cp_gather_event = _tbo_event(("cpgather", sub))
+                state.cp_gather_event.record(comm)
+            # Keep the gather input alive until op_cp_gather_b orders compute
+            # after the gather (replaces record_stream; avoids reserved churn).
+            state.cp_gather_keepalive = local
+        else:
+            attn_cp_all_gather_into_tensor(global_hidden, local.contiguous())
+            state.cp_gather_event = None
+        state.global_hidden = global_hidden
+
+    def op_cp_gather_b(self, state):
+        ev = state.pop("cp_gather_event")
+        if ev is not None:
+            torch.cuda.current_stream().wait_event(ev)
+            state.pop("cp_gather_keepalive")
+
+    def op_cp_moe(self, state):
+        fb = state.forward_batch
+        global_hidden = state.pop("global_hidden")
+        global_ids = fb._cp_moe_input_ids
+        with get_forward().scoped(mlp_reduce_scatter=True):
+            state.global_expert_out = self.mlp(
+                global_hidden,
+                fb,
+                input_ids=global_ids,
+                input_ids_global=global_ids,
+            )
+
+    def op_cp_combine_a(self, state):
+        # CP-group reduce-scatter (global partial expert sums -> this rank's
+        # local tokens). Symmetric inverse of op_cp_gather_a's all-gather.
+        global_out = state.pop("global_expert_out")
+        cp_size = get_parallel().attn_cp_size
+        sub = state.tbo_subbatch_index
+        local_out = get_tbo_persistent_buffer(
+            ("cplo", sub),
+            global_out.shape[0] // cp_size,
+            global_out.shape[1],
+            global_out.dtype,
+            global_out.device,
+        )
+        if _CP_TBO_COMM_OVERLAP:
+            comm = get_dp_tbo_comm_stream()
+            compute = torch.cuda.current_stream()
+            with torch.cuda.stream(comm):
+                comm.wait_stream(compute)
+                attn_cp_reduce_scatter_tensor(local_out, global_out.contiguous())
+                state.cp_combine_event = _tbo_event(("cpcombine", sub))
+                state.cp_combine_event.record(comm)
+            state.cp_combine_keepalive = global_out
+        else:
+            attn_cp_reduce_scatter_tensor(local_out, global_out.contiguous())
+            state.cp_combine_event = None
+        state.local_out = local_out
+
+    def op_cp_combine_b(self, state):
+        ev = state.pop("cp_combine_event")
+        if ev is not None:
+            torch.cuda.current_stream().wait_event(ev)
+            state.pop("cp_combine_keepalive")
+        state.hidden_states_mlp_output = state.pop("local_out")
+
 
 class DeepseekV4Model(nn.Module):
     fall_back_to_pt_during_load = False
@@ -2141,11 +2362,38 @@ class DeepseekV4Model(nn.Module):
         TBO batch prep (tbo_split_seq_index / tbo_children) is populated
         model-agnostically when --enable-two-batch-overlap is set and the
         DP-attention preparer allows it (mori `normal` mode permits prefill
-        TBO). We additionally restrict to: prefill (EXTEND), single PP, and the
-        non-CP path, which is the only case the DSV4 op strategy implements.
+        TBO). We additionally restrict to: prefill (EXTEND) and single PP.
+
+        Two op strategies are implemented for DSV4 prefill TBO:
+          * the non-CP DP TP-MoE path (overlaps the DP all_gatherv /
+            reduce_scatterv), and
+          * the DSA prefill context-parallel path (round-robin / interleave,
+            moe_a2a_backend == none), which overlaps the CP-group all-gather /
+            reduce-scatter and the per-layer attention CP all-gathers.
+        Other CP variants (deepep a2a, zigzag) are not wired for TBO yet, so
+        keep the plain non-CP path for those.
         """
         from sglang.srt.layers.moe import is_tbo_enabled
 
+        if dsa_use_prefill_cp(forward_batch):
+            # CP + TBO: overlap the CP-group all-gather / reduce-scatter
+            # (round-robin / interleave, non-EP TP-MoE). See
+            # _forward_layers_tbo_cp.
+            path_ok = (
+                is_dsa_prefill_cp_round_robin_split()
+                and get_moe_a2a_backend().is_none()
+            )
+        else:
+            # Non-CP TBO: the DP TP-MoE path needs DP attention (attn_dp_size > 1,
+            # so op_gather/op_combine build the per-ubatch DP gatherv + global
+            # input_ids); the EP path (moe_a2a_backend != none) handles its own
+            # dispatch. Under a CP server with dp_size == 1 (attn_dp_size == 1) a
+            # non-CP-active batch (e.g. a tiny warmup prefill that fails
+            # can_dsa_cp_split) has neither, so fall back to the eager loop
+            # instead of the (invalid) DP TBO ops.
+            path_ok = (
+                not get_moe_a2a_backend().is_none() or get_parallel().attn_dp_size > 1
+            )
         return (
             is_tbo_enabled()
             and forward_batch.can_run_tbo
@@ -2154,7 +2402,7 @@ class DeepseekV4Model(nn.Module):
             # MTP target-verify also reports is_extend(); only real prefill
             # should enter the prefill TBO strategy.
             and forward_batch.global_forward_mode.is_extend_without_speculative()
-            and not dsa_use_prefill_cp(forward_batch)
+            and path_ok
             and self.pp_group.world_size == 1
         )
 
@@ -2170,6 +2418,15 @@ class DeepseekV4Model(nn.Module):
             _model_forward_filter_inputs,
             _model_forward_tbo_merge_outputs,
         )
+
+        # DSA prefill context-parallel + TBO uses a distinct per-child split /
+        # gather path (CP-group collectives instead of the DP gatherv/scatterv).
+        if dsa_use_prefill_cp(forward_batch):
+            return self._forward_layers_tbo_cp(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
 
         layers = [self.layers[i] for i in range(self.start_layer, self.end_layer)]
         operations_strategy = OperationsStrategy.init_new_tbo(
@@ -2247,6 +2504,141 @@ class DeepseekV4Model(nn.Module):
         )
         return hidden_states
 
+    def _setup_child_cp_metadata(self, child: ForwardBatch, child_backend) -> None:
+        """Build one TBO ubatch's CP metadata and CP-reindex its own attention
+        backend metadata (DSA round-robin split).
+
+        Mirrors DeepseekV4ForCausalLM.forward's whole-batch CP setup, but scoped
+        to a single child. The child's out_cache_loc / seq_lens were padded to a
+        multiple of cp_size (via the cp-aligned tbo_padded_len), so the child's
+        core attention metadata (seq_lens_casual) is divisible by cp_size:
+        apply_cp_reindex slices the query side per CP rank while keeping the KV
+        write locations global over the child token range.
+        """
+        cp_rank = get_parallel().attn_cp_rank
+        cp_size = get_parallel().attn_cp_size
+        child.attn_cp_metadata = prepare_context_parallel_metadata(
+            len(child.input_ids),
+            cp_rank,
+            cp_size,
+            child.seq_lens_cpu.tolist(),
+            extend_seqs_len=child.extend_seq_lens_cpu,
+        )
+        if is_dsa_prefill_cp_round_robin_split():
+            metadata = child_backend.forward_metadata
+            core_meta = metadata.core_attn_metadata
+            core_meta.apply_cp_reindex()
+            core_meta.init_flashmla_related(is_prefill=True)
+            if metadata.indexer_metadata is not None:
+                metadata.indexer_metadata = child_backend.init_forward_metadata_indexer(
+                    core_meta
+                )
+
+    def _forward_layers_tbo_cp(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """CP + TBO prefill (DSA round-robin / interleave, moe_a2a_backend none).
+
+        Each of the two token-range ubatches (tbo_children) is independently
+        round-robin split across the CP group (token_idx % cp_size) and its
+        attention metadata is CP-reindexed on its own per-child backend. The two
+        ubatches then run through the operations engine, where op_cp_gather /
+        op_cp_moe / op_cp_combine handle the CP-group all-gather / reduce-scatter
+        around the TP-sharded MoE. Finally each child's local output is
+        all-gathered back to its full token range and the two ranges are merged
+        into the full-batch hidden (original token order).
+        """
+        from sglang.srt.batch_overlap.operations import execute_overlapped_operations
+        from sglang.srt.batch_overlap.operations_strategy import OperationsStrategy
+        from sglang.srt.batch_overlap.two_batch_overlap import (
+            _model_forward_filter_inputs,
+            _model_forward_tbo_merge_outputs,
+        )
+
+        original_len = hidden_states.shape[0]
+        cp_size = get_parallel().attn_cp_size
+        layers = [self.layers[i] for i in range(self.start_layer, self.end_layer)]
+        operations_strategy = OperationsStrategy.init_new_tbo(
+            layers, forward_batch.global_forward_mode, use_cp=True
+        )
+
+        attn_backend = get_attn_backend()
+        children = forward_batch.tbo_children
+
+        if not getattr(DeepseekV4Model, "_cp_tbo_logged", False):
+            DeepseekV4Model._cp_tbo_logged = True
+            logger.info(
+                "[CP+TBO] _forward_layers_tbo_cp engaged: cp_size=%d, "
+                "per-child input_ids tokens=%s",
+                cp_size,
+                [int(c.input_ids.shape[0]) for c in children],
+            )
+
+        inputs_arr = []
+        for idx, child in enumerate(children):
+            # Slice this ubatch's token range out of the full-batch hidden /
+            # positions and pad to the (cp-aligned) tbo_padded_len.
+            child_inputs = _model_forward_filter_inputs(
+                hidden_states=hidden_states,
+                residual=None,
+                positions=positions,
+                output_forward_batch=child,
+                tbo_subbatch_index=idx,
+            )
+            # Build this child's CP metadata + CP-reindex its own attention
+            # backend (children[idx] holds the sub-batch attention metadata).
+            self._setup_child_cp_metadata(child, attn_backend.children[idx])
+            # Round-robin split the child hidden / positions to this CP rank's
+            # local tokens; cache the child's global (rearranged) input_ids for
+            # the CP MoE gather in op_cp_moe.
+            if self.pp_group.is_first_rank:
+                child_inputs["hidden_states"] = cp_split_and_rebuild_data(
+                    child, child_inputs["hidden_states"]
+                )
+            child_inputs["positions"] = cp_split_and_rebuild_position(
+                child, child_inputs["positions"]
+            )
+            child._cp_moe_input_ids = cp_round_robin_input_ids(child.input_ids)
+            inputs_arr.append(child_inputs)
+
+        # Route every round-robin CP all-gather (KV / indexer / compressor inside
+        # op_attn, and the final hidden restore below) onto the same shared comm
+        # stream the CP MoE gather / reduce-scatter use, so all CP-group
+        # collectives serialize on one stream (RCCL deadlocks if same-communicator
+        # collectives run concurrently across streams). Gated by
+        # SGLANG_CP_TBO_COMM_OVERLAP: when off, everything stays on the compute
+        # stream (no overlap, but no cross-stream serialization overhead).
+        set_cp_tbo_comm_stream(
+            get_dp_tbo_comm_stream() if _CP_TBO_COMM_OVERLAP else None
+        )
+        try:
+            outputs_arr = execute_overlapped_operations(
+                inputs_arr=inputs_arr,
+                operations_arr=[operations_strategy.operations] * 2,
+                delta_stages=[0, operations_strategy.tbo_delta_stages],
+            )
+
+            # Restore each ubatch's local hidden to its full token range
+            # (all-gather + reorder to original token order), then merge the two
+            # token ranges into the full-batch hidden.
+            if self.pp_group.is_last_rank:
+                for idx, child in enumerate(children):
+                    outputs_arr[idx]["hidden_states"] = cp_all_gather_rerange_output(
+                        outputs_arr[idx]["hidden_states"],
+                        cp_size,
+                        child,
+                        torch.cuda.current_stream(),
+                    )
+        finally:
+            set_cp_tbo_comm_stream(None)
+        hidden_states, _ = _model_forward_tbo_merge_outputs(
+            outputs_arr[0], outputs_arr[1], original_len
+        )
+        return hidden_states
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -2280,7 +2672,12 @@ class DeepseekV4Model(nn.Module):
         else:
             input_ids_global = input_ids
 
-        if dsa_use_prefill_cp(forward_batch):
+        # Under CP + TBO the per-ubatch round-robin split (and the trailing
+        # all-gather restore) happens inside _forward_layers_tbo, where each
+        # child is split on its own token range and its attention metadata is
+        # CP-reindexed. So skip the whole-batch split here when TBO will run.
+        run_tbo = self._can_run_tbo(forward_batch)
+        if dsa_use_prefill_cp(forward_batch) and not run_tbo:
             if self.pp_group.is_first_rank:
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
@@ -2303,7 +2700,7 @@ class DeepseekV4Model(nn.Module):
         # DSpark aux capture needs the per-layer eager loop (TBO's overlapped
         # execution cannot expose per-layer completed hidden states), so skip
         # TBO when capturing -- a perf-only downgrade, not a correctness one.
-        if self._can_run_tbo(forward_batch) and not capture_dspark:
+        if run_tbo and not capture_dspark:
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
             # disabled here (each layer self-contained), so no trailing hc_post.
             hidden_states = self._forward_layers_tbo(
@@ -2348,7 +2745,14 @@ class DeepseekV4Model(nn.Module):
                 )
 
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
-        if self.pp_group.is_last_rank and dsa_use_prefill_cp(forward_batch):
+        # CP + TBO restores each child inside _forward_layers_tbo (returning the
+        # merged full-batch hidden), so only the non-TBO CP path needs the
+        # whole-batch all-gather here.
+        if (
+            self.pp_group.is_last_rank
+            and dsa_use_prefill_cp(forward_batch)
+            and not run_tbo
+        ):
             hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
                 self.cp_size,
